@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: stremio-streamed-addon
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node src/index.js
+    healthCheckPath: /manifest.json
+    envVars:
+      - key: NODE_ENV
+        value: production
