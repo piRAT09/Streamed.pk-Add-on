@@ -1,0 +1,19 @@
+{
+  "name": "streamed-pk-addon",
+  "version": "1.0.0",
+  "description": "Stremio addon that provides live sports streams from streamed.pk",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "stremio-addon-sdk": "^1.6.10",
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "keywords": ["stremio", "addon", "sports", "live"],
+  "license": "MIT"
+}
