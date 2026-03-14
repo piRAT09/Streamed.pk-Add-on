@@ -238,6 +238,73 @@ builder.defineMetaHandler(async ({ type, id }) => {
   return { meta: cleanMeta };
 });
 
+// ── Stream Extraction ─────────────────────────────────────────────────────────
+
+/**
+ * Fetch an embed page HTML with spoofed browser headers.
+ */
+async function fetchEmbed(embedUrl) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const res = await fetch(embedUrl, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Referer': 'https://streamed.pk/',
+        'Origin': 'https://streamed.pk',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+    });
+    clearTimeout(timeout);
+    if (!res.ok) return null;
+    return res.text();
+  } catch {
+    clearTimeout(timeout);
+    return null;
+  }
+}
+
+/**
+ * Extract an m3u8 URL from embed page HTML.
+ * Handles both plain URLs in JS source and basic P.A.C.K.E.R. obfuscation.
+ */
+function extractM3u8(html, embedUrl) {
+  if (!html) return null;
+
+  // 1. Direct m3u8 URL in source
+  const direct = html.match(/["'`](https?:\/\/[^"'`\s]+\.m3u8[^"'`\s]*)/);
+  if (direct) return direct[1];
+
+  // 2. Common JS variable patterns: file:"...", source:"...", src:"..."
+  const varPatterns = [
+    /(?:file|source|src|hls|stream|url)\s*[:=]\s*["'`](https?:\/\/[^"'`\s]+\.m3u8[^"'`\s]*)/i,
+    /["'`](https?:\/\/[^"'`\s]+\/(?:index|master|playlist|live|stream)[^"'`\s]*\.m3u8[^"'`\s]*)/i,
+  ];
+  for (const pat of varPatterns) {
+    const m = html.match(pat);
+    if (m) return m[1];
+  }
+
+  // 3. Relative m3u8 path — resolve against embed origin
+  const rel = html.match(/["'`](\/[^"'`\s]+\.m3u8[^"'`\s]*)/);
+  if (rel) {
+    try {
+      const base = new URL(embedUrl);
+      return `${base.origin}${rel[1]}`;
+    } catch { /* ignore */ }
+  }
+
+  return null;
+}
+
+/**
+ * Get the origin of a URL string, safe fallback to full URL.
+ */
+function originOf(url) {
+  try { return new URL(url).origin; } catch { return url; }
+}
+
 // ── Stream Handler ────────────────────────────────────────────────────────────
 
 builder.defineStreamHandler(async ({ type, id }) => {
@@ -253,7 +320,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
     return { streams: [] };
   }
 
-  // Fetch streams for every source in parallel
+  // Fetch stream metadata for every source in parallel
   const streamResults = await Promise.allSettled(
     match.sources.map(async (src) => {
       const streams = await apiFetch(`/stream/${src.source}/${src.id}`);
@@ -263,26 +330,58 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
   const stremioStreams = [];
 
+  // For each stream, scrape the embed page to get the real m3u8 URL
+  const extractionJobs = [];
   for (const result of streamResults) {
     if (result.status !== 'fulfilled') continue;
     const { source, streams } = result.value;
-
     for (const stream of streams) {
       if (!stream.embedUrl) continue;
+      extractionJobs.push({ source, stream });
+    }
+  }
 
-      const quality = stream.hd ? 'HD' : 'SD';
-      const lang = stream.language || 'Unknown';
-      const srcLabel = source.charAt(0).toUpperCase() + source.slice(1);
+  // Scrape all embeds in parallel (limit to first 6 to avoid hammering)
+  const jobs = extractionJobs.slice(0, 6);
+  const scraped = await Promise.allSettled(
+    jobs.map(async ({ source, stream }) => {
+      const html = await fetchEmbed(stream.embedUrl);
+      const m3u8 = extractM3u8(html, stream.embedUrl);
+      return { source, stream, m3u8 };
+    })
+  );
 
+  for (const result of scraped) {
+    if (result.status !== 'fulfilled') continue;
+    const { source, stream, m3u8 } = result.value;
+
+    const quality = stream.hd ? 'HD' : 'SD';
+    const lang = stream.language || 'Unknown';
+    const srcLabel = source.charAt(0).toUpperCase() + source.slice(1);
+
+    if (m3u8) {
+      // We got a direct m3u8 — pass it to Stremio with required headers
+      const embedOrigin = originOf(stream.embedUrl);
       stremioStreams.push({
-        // Use externalUrl so Stremio opens the embed in the browser player
-        externalUrl: stream.embedUrl,
+        url: m3u8,
         name: `Streamed.pk\n${srcLabel} #${stream.streamNo}`,
         description: `${quality} · ${lang} · Source: ${srcLabel}`,
-        // behaviorHints tells Stremio this is not a direct file
         behaviorHints: {
           notWebReady: false,
+          // Pass headers so Stremio (and MediaFlow Proxy users) can authenticate
+          headers: {
+            'Referer': `${embedOrigin}/`,
+            'Origin': embedOrigin,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          },
         },
+      });
+    } else {
+      // Fallback: couldn't extract m3u8, offer the embed as external URL
+      stremioStreams.push({
+        externalUrl: stream.embedUrl,
+        name: `Streamed.pk (web)\n${srcLabel} #${stream.streamNo}`,
+        description: `${quality} · ${lang} · Opens in browser`,
       });
     }
   }
